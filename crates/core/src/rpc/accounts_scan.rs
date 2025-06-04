@@ -20,7 +20,7 @@ use spl_token::state::Account as TokenAccount;
 use super::{
     not_implemented_err_async, utils::verify_pubkey, RunloopContext, State, SurfnetRpcContext,
 };
-use crate::surfnet::locker::SvmAccessContext;
+use crate::surfnet::{locker::SvmAccessContext, remote::SomeRemoteCtx};
 
 #[rpc]
 pub trait AccountsScan {
@@ -458,6 +458,7 @@ pub trait AccountsScan {
     ) -> BoxFuture<Result<RpcResponse<Vec<RpcKeyedAccount>>>>;
 }
 
+#[derive(Clone)]
 pub struct SurfpoolAccountsScanRpc;
 impl AccountsScan for SurfpoolAccountsScanRpc {
     type Metadata = Option<RunloopContext>;
@@ -479,31 +480,62 @@ impl AccountsScan for SurfpoolAccountsScanRpc {
         not_implemented_err_async("get_largest_accounts")
     }
 
-    fn get_supply(
-        &self,
-        meta: Self::Metadata,
-        _config: Option<RpcSupplyConfig>,
-    ) -> BoxFuture<Result<RpcResponse<RpcSupply>>> {
-        let svm_locker = match meta.get_svm_locker() {
-            Ok(locker) => locker,
+   fn get_supply(
+    &self,
+    meta: Self::Metadata,
+    config: Option<RpcSupplyConfig>,
+) -> BoxFuture<Result<RpcResponse<RpcSupply>>> {
+    
+    let SurfnetRpcContext { svm_locker, remote_ctx } = 
+        match meta.get_rpc_context(config.as_ref().and_then(|c| c.commitment)) {
+            Ok(res) => res,
             Err(e) => return e.into(),
         };
 
-        Box::pin(async move {
-            svm_locker.with_svm_reader(|svm_reader| {
-                let slot = svm_reader.get_latest_absolute_slot();
-                Ok(RpcResponse {
-                    context: RpcResponseContext::new(slot),
-                    value: RpcSupply {
-                        total: 1,
-                        circulating: 0,
-                        non_circulating: 0,
-                        non_circulating_accounts: vec![],
-                    },
-                })
-            })
+    Box::pin(async move {
+        if let Some((remote_client, remote_commitment)) = remote_ctx {
+
+            let commitment = config.as_ref().and_then(|c| c.commitment).unwrap_or_default();
+           
+            match remote_client.client.supply().await {
+                Ok(remote_supply) => {
+                    let slot = svm_locker.with_svm_reader(|svm| svm.get_latest_absolute_slot());
+                    
+                    let mut result_supply = remote_supply.value;
+                    
+                    if config.as_ref()
+                        .map(|c| c.exclude_non_circulating_accounts_list)
+                        .unwrap_or(false) 
+                    {
+                        result_supply.non_circulating_accounts = vec![];
+                    }
+                    
+                    return Ok(RpcResponse {
+                        context: RpcResponseContext::new(slot),
+                        value: result_supply,
+                    });
+                }
+                Err(e) => {
+                    // 5. Remote failed - log and fall through to local fallback
+                    warn!("Failed to fetch supply from remote: {}", e);
+                }
+            }
+        }
+
+        // fallback
+        let slot = svm_locker.with_svm_reader(|svm| svm.get_latest_absolute_slot());
+        
+        Ok(RpcResponse {
+            context: RpcResponseContext::new(slot),
+            value: RpcSupply {
+                total: 1,
+                circulating: 0,
+                non_circulating: 0,
+                non_circulating_accounts: vec![],
+            },
         })
-    }
+    })
+}
 
     fn get_token_largest_accounts(
         &self,
@@ -604,5 +636,74 @@ impl AccountsScan for SurfpoolAccountsScanRpc {
         _config: Option<RpcAccountInfoConfig>,
     ) -> BoxFuture<Result<RpcResponse<Vec<RpcKeyedAccount>>>> {
         not_implemented_err_async("get_token_accounts_by_delegate")
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    
+    use super::*;
+    use crate::{surfnet::remote::SurfnetRemoteClient, tests::helpers::TestSetup};
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_supply_offline_mode() {
+        let setup = TestSetup::new(SurfpoolAccountsScanRpc);
+
+        // test without config
+        let res = setup
+            .rpc
+            .get_supply(Some(setup.context.clone()), None)
+            .await
+            .unwrap();
+
+        // should return fallback values in offline mode
+        assert_eq!(res.value.total, 1);
+        assert_eq!(res.value.circulating, 0);
+        assert_eq!(res.value.non_circulating, 0);
+        assert!(res.value.non_circulating_accounts.is_empty());
+        assert_eq!(res.context.slot, 123);
+    }
+
+    #[ignore = "requires-network"]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_supply_from_mainnet() {
+        let remote_client = SurfnetRemoteClient::new("https://api.mainnet-beta.solana.com");
+        let mut setup = TestSetup::new(SurfpoolAccountsScanRpc);
+
+        setup.context.remote_rpc_client = Some(remote_client);
+        
+        let config = RpcSupplyConfig {
+            commitment: Some(CommitmentConfig::processed()),
+            exclude_non_circulating_accounts_list: false,
+        };
+        
+        let res = setup.rpc.get_supply(Some(setup.context), Some(config)).await.unwrap();
+
+        println!("total: {:?}, circulating: {:?}", res.value.total, res.value.circulating);
+
+        assert!(!res.value.non_circulating_accounts.is_empty());
+        assert!(res.value.total > 0);
+    }
+
+    #[ignore = "requires-network"]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_get_supply_from_mainnet_exclude_non_circ_accounts() {
+        let remote_client = SurfnetRemoteClient::new("https://api.mainnet-beta.solana.com");
+        let mut setup = TestSetup::new(SurfpoolAccountsScanRpc);
+
+        setup.context.remote_rpc_client = Some(remote_client);
+        
+        let config = RpcSupplyConfig {
+            commitment: Some(CommitmentConfig::processed()),
+            exclude_non_circulating_accounts_list: true,
+        };
+        
+        let res = setup.rpc.get_supply(Some(setup.context), Some(config)).await.unwrap();
+
+        println!("total: {:?}, circulating: {:?}, {:?}", res.value.total, res.value.circulating, res.value.non_circulating_accounts);
+
+        assert!(res.value.non_circulating_accounts.is_empty());
+        assert!(res.value.total > 0);
     }
 }
